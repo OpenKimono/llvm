@@ -31,7 +31,9 @@ STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumAccessesWithBadSize, "Number of accesses with bad size");
 
 static const char *const CsiModuleCtorName = "csi.module_ctor";
-static const char *const CsiInitName = "__csi_init";
+static const char *const CsiModuleInitName = "__csi_module_init";
+static const char *const CsiInitCtorName = "csi.init_ctor";
+static const char *const CsiInitName = "__csi_rt_init_program";
 
 namespace {
 
@@ -53,7 +55,7 @@ private:
   // actually insert the instrumentation call
   bool instrumentLoadOrStore(inst_iterator Iter, const DataLayout &DL);
 
-  Function *CsiCtorFunction;
+  Function *CsiCtorFunction, *CsiModuleCtorFunction;
 
   Function *CsiBeforeRead;
   Function *CsiAfterRead;
@@ -244,8 +246,15 @@ bool CodeSpectatorInterface::instrumentLoadOrStore(inst_iterator Iter,
 bool CodeSpectatorInterface::doInitialization(Module &M) {
   DEBUG_WITH_TYPE("csi-func", errs() << "CSI_func: doInitialization" << "\n");
 
+  // Add call to module init
+  std::tie(CsiModuleCtorFunction, std::ignore) = createSanitizerCtorAndInitFunctions(
+      M, CsiModuleCtorName, CsiModuleInitName, /*InitArgTypes=*/{},
+      /*InitArgs=*/{});
+  appendToGlobalCtors(M, CsiModuleCtorFunction, 0);
+
+  // Add call to tool init
   std::tie(CsiCtorFunction, std::ignore) = createSanitizerCtorAndInitFunctions(
-      M, CsiModuleCtorName, CsiInitName, /*InitArgTypes=*/{},
+      M, CsiInitCtorName, CsiInitName, /*InitArgTypes=*/{},
       /*InitArgs=*/{});
   appendToGlobalCtors(M, CsiCtorFunction, 0);
 
@@ -309,4 +318,3 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
   }
   return Modified;
 }
-
