@@ -31,8 +31,8 @@ STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumAccessesWithBadSize, "Number of accesses with bad size");
 
 static const char *const CsiModuleCtorName = "csi.module_ctor";
+static const char *const CsiModuleIdName = "__csi_module_id";
 static const char *const CsiInitName = "__csi_init";
-
 namespace {
 
 struct CodeSpectatorInterface : public FunctionPass {
@@ -55,6 +55,8 @@ private:
   // instrument a call to memmove, memcpy, or memset
   void instrumentMemIntrinsic(inst_iterator I);
 
+  GlobalVariable *ModuleId;
+
   Function *CsiCtorFunction;
 
   Function *CsiBeforeRead;
@@ -68,7 +70,6 @@ private:
 
   Type *IntptrTy;
 }; //struct CodeSpectatorInterface
-
 } //namespace
 
 // the address matters but not the init value
@@ -293,6 +294,10 @@ bool CodeSpectatorInterface::doInitialization(Module &M) {
       /*InitArgs=*/{});
   appendToGlobalCtors(M, CsiCtorFunction, 0);
 
+  IntegerType *ty = IntegerType::get(M.getContext(), 32);
+
+  ModuleId = new GlobalVariable(M, ty, false, GlobalValue::InternalLinkage, ConstantInt::get(ty, 0), CsiModuleIdName);
+
   initializeFuncCallbacks(M);
   initializeLoadStoreCallbacks(M);
   DEBUG_WITH_TYPE("csi-func",
@@ -362,3 +367,46 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
   return Modified;
 }
 
+// End of compile-time pass
+// ------------------------------------------------------------------------
+// LTO (link-time) pass
+
+namespace {
+
+struct CodeSpectatorInterfaceLT : public ModulePass {
+  static char ID;
+
+  CodeSpectatorInterfaceLT() : ModulePass(ID), moduleId(0) {}
+  const char *getPassName() const override;
+  bool runOnModule(Module &M) override;
+
+private:
+  unsigned moduleId;
+}; //struct CodeSpectatorInterfaceLT
+
+} // namespace
+
+char CodeSpectatorInterfaceLT::ID = 0;
+INITIALIZE_PASS(CodeSpectatorInterfaceLT, "CSI-lt", "CodeSpectatorInterface link-time pass",
+                false, false)
+
+ModulePass *llvm::createCodeSpectatorInterfaceLTPass() {
+  return new CodeSpectatorInterfaceLT();
+}
+
+const char *CodeSpectatorInterfaceLT::getPassName() const {
+  return "CodeSpectatorInterfaceLT";
+}
+
+bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
+  bool modified = false;
+  for (GlobalVariable &GV : M.getGlobalList()) {
+    if (GV.hasName() && GV.getName().startswith(CsiModuleIdName)) {
+      assert(GV.hasInitializer());
+      Constant *UniqueModuleId = ConstantInt::get(GV.getInitializer()->getType(), moduleId++);
+      GV.setInitializer(UniqueModuleId);
+      modified = true;
+    }
+  }
+  return modified;
+}

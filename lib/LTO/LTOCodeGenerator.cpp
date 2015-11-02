@@ -49,6 +49,7 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Target/TargetRegisterInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
+#include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/ObjCARC.h"
@@ -102,6 +103,7 @@ LTOCodeGenerator::~LTOCodeGenerator() {
 void LTOCodeGenerator::initializeLTOPasses() {
   PassRegistry &R = *PassRegistry::getPassRegistry();
 
+  initializeCodeSpectatorInterfaceLTPass(R);
   initializeInternalizePassPass(R);
   initializeIPSCCPPass(R);
   initializeGlobalOptPass(R);

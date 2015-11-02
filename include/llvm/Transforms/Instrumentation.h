@@ -86,6 +86,8 @@ ModulePass *createInstrProfilingPass(
 // Insert CodeSpectatorInterface instrumentation
 // ANGE XXX: Should probably add different compiler flag options
 FunctionPass *createCodeSpectatorInterfacePass();
+// Insert CodeSpectatorInterface link-time pass
+ModulePass *createCodeSpectatorInterfaceLTPass();
 
 // Insert AddressSanitizer (address sanity checking) instrumentation
 FunctionPass *createAddressSanitizerFunctionPass(bool CompileKernel = false);
