@@ -38,6 +38,7 @@ static const char *const CsiModuleInitName = "__csi_module_init";
 static const char *const CsiModuleIdName = "__csi_module_id";
 static const char *const CsiInitCtorName = "csi.init_ctor";
 static const char *const CsiInitName = "__csi_init";
+static const char *const CsiBBIdBaseName = "__csi_bb_id_base";
 // See llvm/tools/clang/lib/CodeGen/CodeGenModule.h:
 static const int CsiModuleCtorPriority = 65535,
     CsiInitCtorPriority = 65534;
@@ -94,6 +95,13 @@ private:
   CallGraph *CG;
   bool CsiInitialized;
   GlobalVariable *ModuleId;
+
+  // At the end of the compile phase, this variable will hold the number of basic blocks in the module.
+  // The link phase will replace that with the base id (i.e., the number of basic blocks seen by the
+  // linker up to that point). When calling CsiBBEntry, we add that value to the basic block's local id
+  // to get a globally unique id for the block.
+  GlobalVariable *BbIdBase;
+
   uint64_t NextBasicBlockId;
   Function *CsiModuleCtorFunction;
 
@@ -146,8 +154,9 @@ void CodeSpectatorInterface::initializeBasicBlockCallbacks(Module &M) {
   // XXX: Don't use structs until LTO optimizes calls using structs away.
   // CsiBBEntry = checkCsiInterfaceFunction(M.getOrInsertFunction(
   //     "__csi_bb_entry", IRB.getVoidTy(), CsiIdType, nullptr));
-  SmallVector<Type *, 4> ArgTypes({IRB.getInt32Ty()});
-  CsiBBEntry = checkCsiInterfaceFunction(M.getOrInsertFunction("__csi_bb_entry", FunctionType::get(IRB.getVoidTy(), ArgTypes, false)));
+  SmallVector<Type *, 4> ArgTypes({IRB.getInt32Ty(), IRB.getInt32Ty()});
+  CsiBBEntry = checkCsiInterfaceFunction(
+      M.getOrInsertFunction("__csi_bb_entry", FunctionType::get(IRB.getVoidTy(), ArgTypes, false)));
   
   CsiBBExit = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_bb_exit", IRB.getVoidTy(), nullptr));
@@ -341,7 +350,12 @@ bool CodeSpectatorInterface::instrumentBasicBlock(BasicBlock &BB) {
   // Id = IRB.CreateInsertValue(Id, IRB.getInt64(GetNextBasicBlockId()), 1);
   // IRB.CreateCall(CsiBBEntry, {Id});
   Value *mid = IRB.CreateLoad(ModuleId);
-  IRB.CreateCall(CsiBBEntry, {mid, IRB.getInt64(GetNextBasicBlockId())});
+
+  Value *localId = IRB.getInt32(GetNextBasicBlockId());
+  Value *baseId = IRB.CreateLoad(BbIdBase);
+  Value *uniqueBbId = IRB.CreateAdd(baseId, localId);
+  IRB.CreateCall(CsiBBEntry, {mid, uniqueBbId});
+
   TerminatorInst *TI = BB.getTerminator();
   IRB.SetInsertPoint(TI);
   IRB.CreateCall(CsiBBExit, {});
@@ -381,6 +395,9 @@ void CodeSpectatorInterface::InitializeCsi(Module &M) {
     if (ShouldNotInstrumentFunction(F)) continue;
     NumBasicBlocks += F.size();
   }
+
+  BbIdBase = new GlobalVariable(M, Int32Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int32Ty, NumBasicBlocks), CsiBBIdBaseName);
+  assert(BbIdBase);
 
   // Add CSI global constructor, which calls module init.
   Function *Ctor = Function::Create(
@@ -586,12 +603,13 @@ namespace {
 struct CodeSpectatorInterfaceLT : public ModulePass {
   static char ID;
 
-  CodeSpectatorInterfaceLT() : ModulePass(ID), moduleId(0) {}
+  CodeSpectatorInterfaceLT() : ModulePass(ID), moduleId(0), basicBlocksSeen(0) {}
   const char *getPassName() const override;
   bool runOnModule(Module &M) override;
 
 private:
   unsigned moduleId;
+  unsigned basicBlocksSeen;
   Function *CsiCtorFunction;
 }; //struct CodeSpectatorInterfaceLT
 
@@ -613,13 +631,23 @@ bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
   // LLVMContext &C = M.getContext();
   // StructType *CsiInfoType = StructType::create({IntegerType::get(C, 32)},
   //                                              "__csi_info_t");
-
   for (GlobalVariable &GV : M.getGlobalList()) {
-    if (GV.hasName() && GV.getName().startswith(CsiModuleIdName)) {
-      assert(GV.hasInitializer());
-      Constant *UniqueModuleId = ConstantInt::get(GV.getInitializer()->getType(), moduleId++);
-      GV.setInitializer(UniqueModuleId);
-      GV.setConstant(true);
+    if (GV.hasName()) {
+      StringRef name = GV.getName();
+      if (name.startswith(CsiModuleIdName)) {
+        assert(GV.hasInitializer());
+        Constant *UniqueModuleId = ConstantInt::get(GV.getInitializer()->getType(), moduleId++);
+        GV.setInitializer(UniqueModuleId);
+        GV.setConstant(true);
+      } else if (name.startswith(CsiBBIdBaseName)) {
+        assert(GV.hasInitializer());
+        uint32_t blocksInModule = (uint32_t)GV.getInitializer()->getUniqueInteger().getLimitedValue();
+        Constant *UniqueBbIdBase = ConstantInt::get(GV.getInitializer()->getType(), basicBlocksSeen);
+        GV.setInitializer(UniqueBbIdBase);
+        GV.setConstant(true);
+        basicBlocksSeen += blocksInModule;
+        printf("Module has %d blocks. Current total %d\n", blocksInModule, basicBlocksSeen);
+      }
     }
   }
 
