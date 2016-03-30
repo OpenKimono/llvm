@@ -5,6 +5,7 @@
 #include "llvm/ADT/StringExtras.h" // for itostr function
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -33,15 +34,23 @@ STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumAccessesWithBadSize, "Number of accesses with bad size");
 
-static const char *const CsiModuleCtorName = "csi.module_ctor";
-static const char *const CsiModuleInitName = "__csi_module_init";
-static const char *const CsiModuleIdName = "__csi_module_id";
+static const char *const CsiRtTixInitName = "__csirt_tix_init";
+
+static const char *const CsiUnitCtorName = "csi.unit_ctor";
+static const char *const CsiUnitInitName = "__csi_unit_init";
+static const char *const CsiUnitIdName = "__csi_unit_id";
+static const char *const CsiUnitBaseName = "__csi_unit_base";
+static const char *const CsiUnitBasePtrName = "__csi_unit_base_ptr";
+
 static const char *const CsiInitCtorName = "csi.init_ctor";
 static const char *const CsiInitName = "__csi_init";
 static const char *const CsiBBIdBaseName = "__csi_bb_id_base";
 // See llvm/tools/clang/lib/CodeGen/CodeGenModule.h:
 static const int CsiModuleCtorPriority = 65535,
     CsiInitCtorPriority = 65534;
+
+// This should be the same value as found in csirt.c
+static const int ENTRY_OFFSET_BITS = 32;
 
 namespace {
 
@@ -94,7 +103,9 @@ private:
 
   CallGraph *CG;
   bool CsiInitialized;
-  GlobalVariable *ModuleId;
+
+  GlobalVariable *UnitBasePtr;  // this will be a constant pointer to a non-constant value
+  GlobalVariable *UnitOffset;
 
   // At the end of the compile phase, this variable will hold the number of basic blocks in the module.
   // The link phase will replace that with the base id (i.e., the number of basic blocks seen by the
@@ -116,8 +127,6 @@ private:
   Function *MemmoveFn, *MemcpyFn, *MemsetFn;
 
   Type *IntptrTy;
-  StructType *CsiIdType;
-  StructType *CsiAccPropType;
 }; //struct CodeSpectatorInterface
 } //namespace
 
@@ -145,16 +154,14 @@ void CodeSpectatorInterface::initializeFuncCallbacks(Module &M) {
   CsiFuncEntry = checkCsiInterfaceFunction(M.getOrInsertFunction(
       "__csi_func_entry", IRB.getVoidTy(), IRB.getInt8PtrTy(),
       IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), nullptr));
-  CsiFuncExit = checkCsiInterfaceFunction(
-      M.getOrInsertFunction("__csi_func_exit", IRB.getVoidTy(), nullptr));
+  CsiFuncExit = checkCsiInterfaceFunction(M.getOrInsertFunction(
+      "__csi_func_exit", IRB.getVoidTy(), IRB.getInt8PtrTy(),
+      IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), nullptr));
 }
 
 void CodeSpectatorInterface::initializeBasicBlockCallbacks(Module &M) {
   IRBuilder<> IRB(M.getContext());
-  // XXX: Don't use structs until LTO optimizes calls using structs away.
-  // CsiBBEntry = checkCsiInterfaceFunction(M.getOrInsertFunction(
-  //     "__csi_bb_entry", IRB.getVoidTy(), CsiIdType, nullptr));
-  SmallVector<Type *, 4> ArgTypes({IRB.getInt32Ty(), IRB.getInt32Ty()});
+  SmallVector<Type *, 4> ArgTypes({IRB.getInt64Ty()});
   CsiBBEntry = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_bb_entry", FunctionType::get(IRB.getVoidTy(), ArgTypes, false)));
   
@@ -177,33 +184,29 @@ void CodeSpectatorInterface::initializeLoadStoreCallbacks(Module &M) {
   Type *RetType = IRB.getVoidTy();            // return void
   Type *AddrType = IRB.getInt8PtrTy();        // void *addr
   Type *NumBytesType = IRB.getInt32Ty();      // int num_bytes
-  // Type *AttrType = IRB.getInt32Ty();          // int attr
-  Type *BoolType = IRB.getInt1Ty();
   
   // Initialize the instrumentation for reads, writes
-  // NOTE: nullptr is a new C++11 construct; denote a null pointer
-  // here, just used to denote end of args;
 
   // void __csi_before_load(void *addr, int num_bytes, int attr);
   CsiBeforeRead = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_before_load", RetType,
-                            AddrType, NumBytesType, IRB.getInt32Ty(), BoolType, BoolType, BoolType, nullptr));
+        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
   // void __csi_after_load(void *addr, int num_bytes, int attr);
   SmallString<32> AfterReadName("__csi_after_load");
   CsiAfterRead = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_after_load", RetType,
-                            AddrType, NumBytesType, IRB.getInt32Ty(), BoolType, BoolType, BoolType, nullptr));
+        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
   // void __csi_before_store(void *addr, int num_bytes, int attr);
   CsiBeforeWrite = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_before_store", RetType,
-                            AddrType, NumBytesType, IRB.getInt32Ty(), BoolType, BoolType, BoolType, nullptr));
+        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
   // void __csi_after_store(void *addr, int num_bytes, int attr);
   CsiAfterWrite = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_after_store", RetType,
-                            AddrType, NumBytesType, IRB.getInt32Ty(), BoolType, BoolType, BoolType, nullptr));
+        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
   MemmoveFn = checkCsiInterfaceFunction(
       M.getOrInsertFunction("memmove", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
@@ -243,10 +246,11 @@ bool CodeSpectatorInterface::addLoadStoreInstrumentation(BasicBlock::iterator It
       // XXX: should I just use the pointer type with the right size?
       {IRB.CreatePointerCast(Addr, AddrType),
        IRB.getInt32(NumBytes),
-       IRB.getInt32(prop.unused),
+       IRB.getInt64(0)});  // TODO(ddoucet): fix this
+       /* IRB.getInt32(prop.unused),
        IRB.getInt1(prop.unused2),
        IRB.getInt1(prop.unused3),
-       IRB.getInt1(prop.read_before_write_in_bb)});
+       IRB.getInt1(prop.read_before_write_in_bb)}); */
 
   // The iterator currently points between the inserted instruction and the
   // store instruction. We now want to insert an instruction after the store
@@ -257,10 +261,11 @@ bool CodeSpectatorInterface::addLoadStoreInstrumentation(BasicBlock::iterator It
   IRB.CreateCall(AfterFn,
       {IRB.CreatePointerCast(Addr, AddrType),
        IRB.getInt32(NumBytes),
-       IRB.getInt32(prop.unused),
+       IRB.getInt64(0)});  // TODO(ddoucet): fix this
+       /* IRB.getInt32(prop.unused),
        IRB.getInt1(prop.unused2),
        IRB.getInt1(prop.unused3),
-       IRB.getInt1(prop.read_before_write_in_bb)});
+       IRB.getInt1(prop.read_before_write_in_bb)}); */
 
   return true;
 }
@@ -285,17 +290,6 @@ bool CodeSpectatorInterface::instrumentLoadOrStore(BasicBlock::iterator Iter,
 
   if (NumBytes == -1) return false; // size that we don't recognize
 
-  /* XXX: This deals ww/ Alignment; come back later
-  const unsigned Alignment = IsWrite ?
-      cast<StoreInst>(I)->getAlignment() : cast<LoadInst>(I)->getAlignment();
-
-  Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
-  const uint32_t TypeSize = DL.getTypeStoreSize(OrigTy);
-  if (Alignment == 0 || Alignment >= 8 || (Alignment % TypeSize) == 0)
-    OnAccessFunc = IsWrite ? TsanWrite[Idx] : TsanRead[Idx];
-  else
-    OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
-  */
   bool Res = false;
   if(IsWrite) {
     Res = addLoadStoreInstrumentation(
@@ -345,16 +339,15 @@ uint64_t CodeSpectatorInterface::GetNextBasicBlockId() {
 
 bool CodeSpectatorInterface::instrumentBasicBlock(BasicBlock &BB) {
   IRBuilder<> IRB(BB.getFirstInsertionPt());
-  // XXX: Don't use structs until LTO optimizes calls using structs away.
-  // Value *Id = IRB.CreateInsertValue(UndefValue::get(CsiIdType), IRB.CreateLoad(ModuleId), 0);
-  // Id = IRB.CreateInsertValue(Id, IRB.getInt64(GetNextBasicBlockId()), 1);
-  // IRB.CreateCall(CsiBBEntry, {Id});
-  Value *mid = IRB.CreateLoad(ModuleId);
 
-  Value *localId = IRB.getInt32(GetNextBasicBlockId());
-  Value *baseId = IRB.CreateLoad(BbIdBase);
-  Value *uniqueBbId = IRB.CreateAdd(baseId, localId);
-  IRB.CreateCall(CsiBBEntry, {mid, uniqueBbId});
+  Value *unitBase = IRB.CreateLoad(IRB.CreateLoad(UnitBasePtr));
+  Value *unitOffset = IRB.CreateLoad(UnitOffset);
+  Value *uniqueUnitId = IRB.CreateAdd(unitBase, unitOffset);
+  Value *shiftedUnitId = IRB.CreateShl(uniqueUnitId, IRB.getInt64(64 - ENTRY_OFFSET_BITS));
+
+  Value *localId = IRB.getInt64((uint64_t)GetNextBasicBlockId());
+  Value *finalId = IRB.CreateOr(shiftedUnitId, localId);
+  IRB.CreateCall(CsiBBEntry, {finalId});
 
   TerminatorInst *TI = BB.getTerminator();
   IRB.SetInsertPoint(TI);
@@ -374,15 +367,16 @@ bool CodeSpectatorInterface::doInitialization(Module &M) {
 
 void CodeSpectatorInterface::InitializeCsi(Module &M) {
   LLVMContext &C = M.getContext();
-  IntegerType *Int1Ty  = IntegerType::get(C, 1),
-              *Int32Ty = IntegerType::get(C, 32),
+  IntegerType *Int32Ty = IntegerType::get(C, 32),
               *Int64Ty = IntegerType::get(C, 64);
+  PointerType *PtrType = PointerType::get(Int64Ty, 0);
 
-  CsiIdType = StructType::create({Int32Ty, Int64Ty}, "__csi_id_t");
-  ModuleId = new GlobalVariable(M, Int32Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int32Ty, 0), CsiModuleIdName);
-  assert(ModuleId);
+  UnitOffset = new GlobalVariable(M, Int64Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int64Ty, 0), CsiUnitIdName);
+  assert(UnitOffset);
 
-  CsiAccPropType = StructType::create({Int64Ty, Int1Ty, Int1Ty, Int1Ty}, "__csi_acc_prop_t");
+  Constant *NullInt64Ptr = ConstantPointerNull::get(PtrType);
+  UnitBasePtr = new GlobalVariable(M, PtrType, false, GlobalValue::InternalLinkage, NullInt64Ptr, CsiUnitBasePtrName);
+  assert(UnitBasePtr);
 
   initializeFuncCallbacks(M);
   initializeLoadStoreCallbacks(M);
@@ -399,26 +393,19 @@ void CodeSpectatorInterface::InitializeCsi(Module &M) {
   BbIdBase = new GlobalVariable(M, Int32Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int32Ty, NumBasicBlocks), CsiBBIdBaseName);
   assert(BbIdBase);
 
-  // Add CSI global constructor, which calls module init.
+  // Add CSI global constructor, which calls unit init.
   Function *Ctor = Function::Create(
       FunctionType::get(Type::getVoidTy(M.getContext()), false),
-      GlobalValue::InternalLinkage, CsiModuleCtorName, &M);
+      GlobalValue::InternalLinkage, CsiUnitCtorName, &M);
   BasicBlock *CtorBB = BasicBlock::Create(M.getContext(), "", Ctor);
   IRBuilder<> IRB(ReturnInst::Create(M.getContext(), CtorBB));
 
-  // XXX: Don't use structs until LTO optimizes calls using structs away.
-  // StructType *CsiModuleInfoType = StructType::create({Int32Ty, Int64Ty}, "__csi_module_info_t");
-  // SmallVector<Type *, 4> InitArgTypes({CsiModuleInfoType});
-  SmallVector<Type *, 4> InitArgTypes({IRB.getInt32Ty(), IRB.getInt64Ty()});
-  Function *InitFunction = dyn_cast<Function>(M.getOrInsertFunction(CsiModuleInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
+  SmallVector<Type *, 4> InitArgTypes({IRB.getInt8PtrTy(), IRB.getInt64Ty()});
+  Function *InitFunction = dyn_cast<Function>(M.getOrInsertFunction(CsiUnitInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
   assert(InitFunction);
 
-  // XXX: Don't use structs until LTO optimizes calls using structs away.
-  // Value *Info = IRB.CreateInsertValue(UndefValue::get(CsiModuleInfoType), IRB.CreateLoad(ModuleId), 0);
-  // Info = IRB.CreateInsertValue(Info, IRB.getInt64(NumBasicBlocks), 1);
-  // CallInst *Call = IRB.CreateCall(InitFunction, {Info});
-  Value *mid = IRB.CreateLoad(ModuleId);
-  CallInst *Call = IRB.CreateCall(InitFunction, {mid, IRB.getInt64(NumBasicBlocks)});
+  Value *ModuleName = IRB.CreateGlobalStringPtr(M.getName());
+  CallInst *Call = IRB.CreateCall(InitFunction, {ModuleName, IRB.getInt64(NumBasicBlocks)});
 
   appendToGlobalCtors(M, Ctor, CsiModuleCtorPriority);
 
@@ -464,7 +451,7 @@ bool CodeSpectatorInterface::FunctionCallsFunction(Function *F, Function *G) {
 
 bool CodeSpectatorInterface::ShouldNotInstrumentFunction(Function &F) {
     Module &M = *F.getParent();
-    if (F.hasName() && F.getName() == CsiModuleCtorName) {
+    if (F.hasName() && F.getName() == CsiUnitCtorName) {
         return true;
     }
     // Don't instrument functions that will run before or
@@ -537,8 +524,6 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
 
   // Traverse all instructions in a function and insert instrumentation
   // on load & store
-  // TODO(ddoucet): the below seems to suggest (as taken from tsan) that a
-  // basic block can have a non-terminating call instruction?
   for (BasicBlock &BB : F) {
     for (auto II = BB.begin(); II != BB.end(); II++) {
       Instruction *I = &(*II);
@@ -583,7 +568,7 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
   for (BasicBlock::iterator I : RetVec) {
       Instruction *RetInst = &(*I);
       IRBuilder<> IRBRet(RetInst);
-      IRBRet.CreateCall(CsiFuncExit, {});
+      IRBRet.CreateCall(CsiFuncExit, {Function, ReturnAddress, FunctionName});
   }
   Modified = true;
 
@@ -603,14 +588,15 @@ namespace {
 struct CodeSpectatorInterfaceLT : public ModulePass {
   static char ID;
 
-  CodeSpectatorInterfaceLT() : ModulePass(ID), moduleId(0), basicBlocksSeen(0) {}
+  CodeSpectatorInterfaceLT() : ModulePass(ID), unitOffset(0), basicBlocksSeen(0), UnitBase(nullptr) {}
   const char *getPassName() const override;
   bool runOnModule(Module &M) override;
 
 private:
-  unsigned moduleId;
+  unsigned unitOffset;
   unsigned basicBlocksSeen;
   Function *CsiCtorFunction;
+
 }; //struct CodeSpectatorInterfaceLT
 
 } // namespace
@@ -628,16 +614,18 @@ const char *CodeSpectatorInterfaceLT::getPassName() const {
 }
 
 bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
+  Type *Int64Ty = IntegerType::get(M.getContext(), 64);
+  GlobalVariable *UnitBase = new GlobalVariable(M, Int64Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int64Ty, 0), CsiUnitBaseName);
   // LLVMContext &C = M.getContext();
   // StructType *CsiInfoType = StructType::create({IntegerType::get(C, 32)},
   //                                              "__csi_info_t");
   for (GlobalVariable &GV : M.getGlobalList()) {
     if (GV.hasName()) {
       StringRef name = GV.getName();
-      if (name.startswith(CsiModuleIdName)) {
+      if (name.startswith(CsiUnitIdName)) {
         assert(GV.hasInitializer());
-        Constant *UniqueModuleId = ConstantInt::get(GV.getInitializer()->getType(), moduleId++);
-        GV.setInitializer(UniqueModuleId);
+        Constant *UniqueUnitOffset = ConstantInt::get(GV.getInitializer()->getType(), unitOffset++);
+        GV.setInitializer(UniqueUnitOffset);
         GV.setConstant(true);
       } else if (name.startswith(CsiBBIdBaseName)) {
         assert(GV.hasInitializer());
@@ -646,7 +634,10 @@ bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
         GV.setInitializer(UniqueBbIdBase);
         GV.setConstant(true);
         basicBlocksSeen += blocksInModule;
-        printf("Module has %d blocks. Current total %d\n", blocksInModule, basicBlocksSeen);
+      } else if (name.startswith(CsiUnitBasePtrName)) {
+        assert(GV.hasInitializer());
+        GV.setInitializer(UnitBase);
+        GV.setConstant(true);
       }
     }
   }
@@ -658,17 +649,18 @@ bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
   BasicBlock *CtorBB = BasicBlock::Create(M.getContext(), "", Ctor);
   IRBuilder<> IRB(ReturnInst::Create(M.getContext(), CtorBB));
 
-  const uint32_t NumModules = moduleId;
-  // XXX: Don't use structs until LTO optimizes calls using structs away.
-  // SmallVector<Type *, 4> InitArgTypes({CsiInfoType});
-  // SmallVector<Value *, 4> InitArgs({ConstantStruct::get(CsiInfoType, {IRB.getInt32(NumModules)})});
-  SmallVector<Type *, 4> InitArgTypes({IRB.getInt32Ty()});
-  SmallVector<Value *, 4> InitArgs({IRB.getInt32(NumModules)});
+  const uint32_t NumModules = unitOffset;
 
-  // XXX: use checkCsiInterfaceFunction here.
-  Constant *InitFunction = M.getOrInsertFunction(CsiInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false));
-  assert(InitFunction);
-  IRB.CreateCall(InitFunction, InitArgs);
+  // The runtime library should call __csi_init
+  Value *Null = ConstantPointerNull::get(IRB.getInt8PtrTy());  // TODO(ddoucet): replace this with the fed entries
+  Value *ModuleName = IRB.CreateGlobalStringPtr(M.getName());
+  Value *UnitBasePtr = IRB.CreatePointerCast(UnitBase, IRB.getInt8PtrTy());
+  SmallVector<Value *, 4> InitArgs({ModuleName, UnitBasePtr, IRB.getInt64(NumModules), Null});
+  SmallVector<Type *, 4> InitArgTypes({IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), IRB.getInt64Ty(), IRB.getInt8PtrTy()});
+  Function *TixInit = checkCsiInterfaceFunction(
+          M.getOrInsertFunction(CsiRtTixInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
+  assert(TixInit);
+  IRB.CreateCall(TixInit, InitArgs);
 
   // Ensure whole-program init is called before module init.
   // TODO: do all targets support this?
