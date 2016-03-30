@@ -46,7 +46,7 @@ static const char *const CsiInitCtorName = "csi.init_ctor";
 static const char *const CsiInitName = "__csi_init";
 static const char *const CsiBBIdBaseName = "__csi_bb_id_base";
 // See llvm/tools/clang/lib/CodeGen/CodeGenModule.h:
-static const int CsiModuleCtorPriority = 65535,
+static const int CsiUnitCtorPriority = 65535,
     CsiInitCtorPriority = 65534;
 
 // This should be the same value as found in csirt.c
@@ -404,10 +404,10 @@ void CodeSpectatorInterface::InitializeCsi(Module &M) {
   Function *InitFunction = dyn_cast<Function>(M.getOrInsertFunction(CsiUnitInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
   assert(InitFunction);
 
-  Value *ModuleName = IRB.CreateGlobalStringPtr(M.getName());
-  CallInst *Call = IRB.CreateCall(InitFunction, {ModuleName, IRB.getInt64(NumBasicBlocks)});
+  Value *UnitName = IRB.CreateGlobalStringPtr(M.getName());
+  CallInst *Call = IRB.CreateCall(InitFunction, {UnitName, IRB.getInt64(NumBasicBlocks)});
 
-  appendToGlobalCtors(M, Ctor, CsiModuleCtorPriority);
+  appendToGlobalCtors(M, Ctor, CsiUnitCtorPriority);
 
   CallGraphNode *CNCtor = CG->getOrInsertFunction(Ctor);
   CallGraphNode *CNFunc = CG->getOrInsertFunction(InitFunction);
@@ -465,7 +465,7 @@ bool CodeSpectatorInterface::ShouldNotInstrumentFunction(Function &F) {
 
         if (Function *CF = dyn_cast<Function>(CS->getOperand(1))) {
             uint64_t Priority = dyn_cast<ConstantInt>(CS->getOperand(0))->getLimitedValue();
-            if (Priority <= CsiModuleCtorPriority) {
+            if (Priority <= CsiUnitCtorPriority) {
                 return CF->getName() == F.getName() ||  FunctionCallsFunction(CF, &F);
             }
         }
@@ -588,7 +588,7 @@ namespace {
 struct CodeSpectatorInterfaceLT : public ModulePass {
   static char ID;
 
-  CodeSpectatorInterfaceLT() : ModulePass(ID), unitOffset(0), basicBlocksSeen(0), UnitBase(nullptr) {}
+  CodeSpectatorInterfaceLT() : ModulePass(ID), unitOffset(0), basicBlocksSeen(0) {}
   const char *getPassName() const override;
   bool runOnModule(Module &M) override;
 
@@ -629,11 +629,11 @@ bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
         GV.setConstant(true);
       } else if (name.startswith(CsiBBIdBaseName)) {
         assert(GV.hasInitializer());
-        uint32_t blocksInModule = (uint32_t)GV.getInitializer()->getUniqueInteger().getLimitedValue();
+        uint32_t blocksInUnit = (uint32_t)GV.getInitializer()->getUniqueInteger().getLimitedValue();
         Constant *UniqueBbIdBase = ConstantInt::get(GV.getInitializer()->getType(), basicBlocksSeen);
         GV.setInitializer(UniqueBbIdBase);
         GV.setConstant(true);
-        basicBlocksSeen += blocksInModule;
+        basicBlocksSeen += blocksInUnit;
       } else if (name.startswith(CsiUnitBasePtrName)) {
         assert(GV.hasInitializer());
         GV.setInitializer(UnitBase);
@@ -649,13 +649,13 @@ bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
   BasicBlock *CtorBB = BasicBlock::Create(M.getContext(), "", Ctor);
   IRBuilder<> IRB(ReturnInst::Create(M.getContext(), CtorBB));
 
-  const uint32_t NumModules = unitOffset;
+  const uint32_t NumUnits = unitOffset;
 
   // The runtime library should call __csi_init
   Value *Null = ConstantPointerNull::get(IRB.getInt8PtrTy());  // TODO(ddoucet): replace this with the fed entries
-  Value *ModuleName = IRB.CreateGlobalStringPtr(M.getName());
+  Value *TixName = IRB.CreateGlobalStringPtr(M.getName());
   Value *UnitBasePtr = IRB.CreatePointerCast(UnitBase, IRB.getInt8PtrTy());
-  SmallVector<Value *, 4> InitArgs({ModuleName, UnitBasePtr, IRB.getInt64(NumModules), Null});
+  SmallVector<Value *, 4> InitArgs({TixName, UnitBasePtr, IRB.getInt64(NumUnits), Null});
   SmallVector<Type *, 4> InitArgTypes({IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), IRB.getInt64Ty(), IRB.getInt8PtrTy()});
   Function *TixInit = checkCsiInterfaceFunction(
           M.getOrInsertFunction(CsiRtTixInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
