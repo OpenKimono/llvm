@@ -7,6 +7,8 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -34,23 +36,18 @@ STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
 STATISTIC(NumAccessesWithBadSize, "Number of accesses with bad size");
 
-static const char *const CsiRtTixInitName = "__csirt_tix_init";
+static const char *const CsiRtUnitInitName = "__csirt_unit_init";
+static const char *const CsiRtUnitCtorName = "csirt.unit_ctor";
+static const char *const CsiUnitBaseIdName = "__csi_unit_base_id";
+static const char *const CsiUnitFedTableName = "__csi_unit_fed_table";
 
-static const char *const CsiUnitCtorName = "csi.unit_ctor";
-static const char *const CsiUnitInitName = "__csi_unit_init";
-static const char *const CsiUnitIdName = "__csi_unit_id";
-static const char *const CsiUnitBaseName = "__csi_unit_base";
-static const char *const CsiUnitBasePtrName = "__csi_unit_base_ptr";
-
-static const char *const CsiInitCtorName = "csi.init_ctor";
-static const char *const CsiInitName = "__csi_init";
-static const char *const CsiBBIdBaseName = "__csi_bb_id_base";
 // See llvm/tools/clang/lib/CodeGen/CodeGenModule.h:
-static const int CsiUnitCtorPriority = 65535,
-    CsiInitCtorPriority = 65534;
+static const int CsiUnitCtorPriority = 65535;
 
-// This should be the same value as found in csirt.c
-static const int ENTRY_OFFSET_BITS = 32;
+typedef struct {
+    int32_t line;
+    StringRef file;
+} fed_entry_t;
 
 namespace {
 
@@ -60,13 +57,14 @@ typedef struct {
   bool read_before_write_in_bb;
 } csi_acc_prop_t;
 
-struct CodeSpectatorInterface : public FunctionPass {
+struct CodeSpectatorInterface : public ModulePass {
   static char ID;
 
-  CodeSpectatorInterface() : FunctionPass(ID), CsiInitialized(false), NextBasicBlockId(0) {}
+  CodeSpectatorInterface() : ModulePass(ID) {}
   const char *getPassName() const override;
   bool doInitialization(Module &M) override;
-  bool runOnFunction(Function &F) override;
+  bool runOnModule(Module &M) override;
+  bool runOnFunction(Function &F);
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   // not overriding doFinalization
@@ -89,6 +87,7 @@ private:
   bool addLoadStoreInstrumentation(BasicBlock::iterator Iter,
                                    Function *BeforeFn,
                                    Function *AfterFn,
+                                   Value *CsiId,
                                    Type *AddrType,
                                    Value *Addr,
                                    int NumBytes,
@@ -99,22 +98,20 @@ private:
   bool FunctionCallsFunction(Function *F, Function *G);
   bool ShouldNotInstrumentFunction(Function &F);
   void InitializeCsi(Module &M);
-  uint64_t GetNextBasicBlockId();
+  void FinalizeCsi(Module &M);
+  Value *InsertFedTable(Module &M);
+
+  SmallVector<Constant *, 4> ConvertFEDEntriesToConsts(Module &M);
+
+  // Inserts computation of the CSI id for the given instrumentation call,
+  // assuming that the call corresponds to the most recent entry in FedEntries.
+  // Returns the csi id as a value, which can be passed as an argument to the
+  // call.
+  Value *InsertCsiIdComputation(IRBuilder<> IRB);
 
   CallGraph *CG;
-  bool CsiInitialized;
 
-  GlobalVariable *UnitBasePtr;  // this will be a constant pointer to a non-constant value
-  GlobalVariable *UnitOffset;
-
-  // At the end of the compile phase, this variable will hold the number of basic blocks in the module.
-  // The link phase will replace that with the base id (i.e., the number of basic blocks seen by the
-  // linker up to that point). When calling CsiBBEntry, we add that value to the basic block's local id
-  // to get a globally unique id for the block.
-  GlobalVariable *BbIdBase;
-
-  uint64_t NextBasicBlockId;
-  Function *CsiModuleCtorFunction;
+  GlobalVariable *UnitBaseId;
 
   Function *CsiBeforeRead;
   Function *CsiAfterRead;
@@ -127,6 +124,8 @@ private:
   Function *MemmoveFn, *MemcpyFn, *MemsetFn;
 
   Type *IntptrTy;
+
+  SmallVector<fed_entry_t, 4> FedEntries;
 }; //struct CodeSpectatorInterface
 } //namespace
 
@@ -139,40 +138,41 @@ const char *CodeSpectatorInterface::getPassName() const {
   return "CodeSpectatorInterface";
 }
 
-FunctionPass *llvm::createCodeSpectatorInterfacePass() {
+ModulePass *llvm::createCodeSpectatorInterfacePass() {
   return new CodeSpectatorInterface();
 }
 
 /**
  * initialize the declaration of function call instrumentation functions
  *
- * void __csi_func_entry(void *function, void *parentReturnAddress, char *funcName);
- * void __csi_func_exit();
+ * void __csi_func_entry(uint64_t csi_id, void *function, void *return_addr, char *func_name);
+ * void __csi_func_exit(uint64_t csi_id, void *function, void *return_addr, char *func_name);
  */
 void CodeSpectatorInterface::initializeFuncCallbacks(Module &M) {
   IRBuilder<> IRB(M.getContext());
   CsiFuncEntry = checkCsiInterfaceFunction(M.getOrInsertFunction(
-      "__csi_func_entry", IRB.getVoidTy(), IRB.getInt8PtrTy(),
+      "__csi_func_entry", IRB.getVoidTy(), IRB.getInt64Ty(), IRB.getInt8PtrTy(),
       IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), nullptr));
   CsiFuncExit = checkCsiInterfaceFunction(M.getOrInsertFunction(
-      "__csi_func_exit", IRB.getVoidTy(), IRB.getInt8PtrTy(),
+      "__csi_func_exit", IRB.getVoidTy(), IRB.getInt64Ty(), IRB.getInt8PtrTy(),
       IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), nullptr));
 }
 
 void CodeSpectatorInterface::initializeBasicBlockCallbacks(Module &M) {
   IRBuilder<> IRB(M.getContext());
   SmallVector<Type *, 4> ArgTypes({IRB.getInt64Ty()});
+  FunctionType *FnType = FunctionType::get(IRB.getVoidTy(), ArgTypes, false);
   CsiBBEntry = checkCsiInterfaceFunction(
-      M.getOrInsertFunction("__csi_bb_entry", FunctionType::get(IRB.getVoidTy(), ArgTypes, false)));
+      M.getOrInsertFunction("__csi_bb_entry", FnType));
   
   CsiBBExit = checkCsiInterfaceFunction(
-      M.getOrInsertFunction("__csi_bb_exit", IRB.getVoidTy(), nullptr));
+      M.getOrInsertFunction("__csi_bb_exit", FnType));
 }
 
 /**
  * initialize the declaration of instrumentation functions
  *
- * void __csi_before_load(void *addr, int num_bytes, int attr);
+ * void __csi_before_load(uint64_t csi_id, void *addr, uint32_t num_bytes, uint64_t prop);
  *
  * where num_bytes = 1, 2, 4, 8.
  *
@@ -187,26 +187,26 @@ void CodeSpectatorInterface::initializeLoadStoreCallbacks(Module &M) {
   
   // Initialize the instrumentation for reads, writes
 
-  // void __csi_before_load(void *addr, int num_bytes, int attr);
+  // void __csi_before_load(uint64_t csi_id, void *addr, int num_bytes, int attr);
   CsiBeforeRead = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_before_load", RetType,
-        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
+        IRB.getInt64Ty(), AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
-  // void __csi_after_load(void *addr, int num_bytes, int attr);
+  // void __csi_after_load(uint64_t csi_id, void *addr, int num_bytes, int attr);
   SmallString<32> AfterReadName("__csi_after_load");
   CsiAfterRead = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_after_load", RetType,
-        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
+        IRB.getInt64Ty(), AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
-  // void __csi_before_store(void *addr, int num_bytes, int attr);
+  // void __csi_before_store(uint64_t csi_id, void *addr, int num_bytes, int attr);
   CsiBeforeWrite = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_before_store", RetType,
-        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
+        IRB.getInt64Ty(), AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
-  // void __csi_after_store(void *addr, int num_bytes, int attr);
+  // void __csi_after_store(uint64_t csi_id, void *addr, int num_bytes, int attr);
   CsiAfterWrite = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_after_store", RetType,
-        AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
+        IRB.getInt64Ty(), AddrType, NumBytesType, IRB.getInt64Ty(), nullptr));
 
   MemmoveFn = checkCsiInterfaceFunction(
       M.getOrInsertFunction("memmove", IRB.getInt8PtrTy(), IRB.getInt8PtrTy(),
@@ -237,6 +237,7 @@ int CodeSpectatorInterface::getNumBytesAccessed(Value *Addr,
 bool CodeSpectatorInterface::addLoadStoreInstrumentation(BasicBlock::iterator Iter,
                                                          Function *BeforeFn,
                                                          Function *AfterFn,
+                                                         Value *CsiId,
                                                          Type *AddrType,
                                                          Value *Addr,
                                                          int NumBytes,
@@ -244,7 +245,8 @@ bool CodeSpectatorInterface::addLoadStoreInstrumentation(BasicBlock::iterator It
   IRBuilder<> IRB(&(*Iter));
   IRB.CreateCall(BeforeFn,
       // XXX: should I just use the pointer type with the right size?
-      {IRB.CreatePointerCast(Addr, AddrType),
+      {CsiId,
+       IRB.CreatePointerCast(Addr, AddrType),
        IRB.getInt32(NumBytes),
        IRB.getInt64(0)});  // TODO(ddoucet): fix this
        /* IRB.getInt32(prop.unused),
@@ -259,7 +261,8 @@ bool CodeSpectatorInterface::addLoadStoreInstrumentation(BasicBlock::iterator It
   IRB.SetInsertPoint(&*Iter);
 
   IRB.CreateCall(AfterFn,
-      {IRB.CreatePointerCast(Addr, AddrType),
+      {CsiId,
+       IRB.CreatePointerCast(Addr, AddrType),
        IRB.getInt32(NumBytes),
        IRB.getInt64(0)});  // TODO(ddoucet): fix this
        /* IRB.getInt32(prop.unused),
@@ -291,14 +294,23 @@ bool CodeSpectatorInterface::instrumentLoadOrStore(BasicBlock::iterator Iter,
   if (NumBytes == -1) return false; // size that we don't recognize
 
   bool Res = false;
+
+  if (DILocation *Loc = I->getDebugLoc()) {
+    FedEntries.push_back(fed_entry_t{(int32_t)Loc->getLine(), Loc->getFilename()});
+  } else {
+    // Not much we can do here
+    FedEntries.push_back(fed_entry_t{-1, ""});
+  }
+  Value *CsiId = InsertCsiIdComputation(IRB);
+
   if(IsWrite) {
     Res = addLoadStoreInstrumentation(
-        Iter, CsiBeforeWrite, CsiAfterWrite, AddrType, Addr, NumBytes, prop);
+        Iter, CsiBeforeWrite, CsiAfterWrite, CsiId, AddrType, Addr, NumBytes, prop);
     NumInstrumentedWrites++;
 
   } else { // is read
     Res = addLoadStoreInstrumentation(
-        Iter, CsiBeforeRead, CsiAfterRead, AddrType, Addr, NumBytes, prop);
+        Iter, CsiBeforeRead, CsiAfterRead, CsiId, AddrType, Addr, NumBytes, prop);
     NumInstrumentedReads++;
   }
 
@@ -333,25 +345,37 @@ void CodeSpectatorInterface::instrumentMemIntrinsic(BasicBlock::iterator Iter) {
   }
 }
 
-uint64_t CodeSpectatorInterface::GetNextBasicBlockId() {
-  return NextBasicBlockId++;
+DILocation *getFirstDebugLoc(BasicBlock &BB) {
+  for (Instruction &Inst : BB)
+    if (DILocation *Loc = Inst.getDebugLoc())
+      return Loc;
+
+  return nullptr;
+}
+
+// Assumes that the instrumentation has already been inserted into the FedEntries vector.
+Value *CodeSpectatorInterface::InsertCsiIdComputation(IRBuilder<> IRB) {
+  Value *unitBaseId = IRB.CreateLoad(UnitBaseId);
+  Value *localOffset = IRB.getInt64((uint64_t)FedEntries.size() - 1);
+  return IRB.CreateAdd(unitBaseId, localOffset);
 }
 
 bool CodeSpectatorInterface::instrumentBasicBlock(BasicBlock &BB) {
+  if (DILocation *Loc = getFirstDebugLoc(BB)) {
+    FedEntries.push_back(fed_entry_t{(int32_t)Loc->getLine(), Loc->getFilename()});
+  } else {
+    // Not much we can do here
+    FedEntries.push_back(fed_entry_t{-1, ""});
+  }
+
   IRBuilder<> IRB(BB.getFirstInsertionPt());
+  Value *CsiId = InsertCsiIdComputation(IRB);
 
-  Value *unitBase = IRB.CreateLoad(IRB.CreateLoad(UnitBasePtr));
-  Value *unitOffset = IRB.CreateLoad(UnitOffset);
-  Value *uniqueUnitId = IRB.CreateAdd(unitBase, unitOffset);
-  Value *shiftedUnitId = IRB.CreateShl(uniqueUnitId, IRB.getInt64(64 - ENTRY_OFFSET_BITS));
-
-  Value *localId = IRB.getInt64((uint64_t)GetNextBasicBlockId());
-  Value *finalId = IRB.CreateOr(shiftedUnitId, localId);
-  IRB.CreateCall(CsiBBEntry, {finalId});
+  IRB.CreateCall(CsiBBEntry, {CsiId});
 
   TerminatorInst *TI = BB.getTerminator();
   IRB.SetInsertPoint(TI);
-  IRB.CreateCall(CsiBBExit, {});
+  IRB.CreateCall(CsiBBExit, {CsiId});
   return true;
 }
 
@@ -367,53 +391,107 @@ bool CodeSpectatorInterface::doInitialization(Module &M) {
 
 void CodeSpectatorInterface::InitializeCsi(Module &M) {
   LLVMContext &C = M.getContext();
-  IntegerType *Int32Ty = IntegerType::get(C, 32),
-              *Int64Ty = IntegerType::get(C, 64);
-  PointerType *PtrType = PointerType::get(Int64Ty, 0);
+  IntegerType *Int64Ty = IntegerType::get(C, 64);
 
-  UnitOffset = new GlobalVariable(M, Int64Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int64Ty, 0), CsiUnitIdName);
-  assert(UnitOffset);
-
-  Constant *NullInt64Ptr = ConstantPointerNull::get(PtrType);
-  UnitBasePtr = new GlobalVariable(M, PtrType, false, GlobalValue::InternalLinkage, NullInt64Ptr, CsiUnitBasePtrName);
-  assert(UnitBasePtr);
+  UnitBaseId = new GlobalVariable(M, Int64Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int64Ty, 0), CsiUnitBaseIdName);
+  assert(UnitBaseId);
 
   initializeFuncCallbacks(M);
   initializeLoadStoreCallbacks(M);
   initializeBasicBlockCallbacks(M);
 
   CG = &getAnalysis<CallGraphWrapperPass>().getCallGraph();
+}
 
-  uint64_t NumBasicBlocks = 0;
-  for (Function &F : M) {
-    if (ShouldNotInstrumentFunction(F)) continue;
-    NumBasicBlocks += F.size();
+StructType *CreateFedEntryType(LLVMContext &C) {
+  return StructType::get(
+      IntegerType::get(C, 32),
+      PointerType::get(IntegerType::get(C, 8), 0),
+      nullptr);
+}
+
+SmallVector<Constant *, 4> CodeSpectatorInterface::ConvertFEDEntriesToConsts(Module &M) {
+  LLVMContext &C = M.getContext();
+  StructType *FedType = CreateFedEntryType(C);
+  IntegerType *Int32Ty = IntegerType::get(C, 32);
+
+  Constant *Zero = ConstantInt::get(Int32Ty, 0);
+  Value *GepArgs[] = {Zero, Zero};
+
+  IRBuilder<> IRB(C);
+  SmallVector<Constant *, 4> Ret;
+
+  for (fed_entry_t &Entry : FedEntries) {
+    Value *Line = ConstantInt::get(Int32Ty, Entry.line);
+
+    // TODO(ddoucet): It'd be nice to reuse the global variables since most
+    // module names will be the same. Do the pointers have the same value as well
+    // or do we actually have to hash the string?
+    Constant *FileStrConstant = ConstantDataArray::getString(C, Entry.file);
+    GlobalVariable *GV = new GlobalVariable(M, FileStrConstant->getType(),
+                                            true, GlobalValue::PrivateLinkage,
+                                            FileStrConstant, "", nullptr,
+                                            GlobalVariable::NotThreadLocal, 0);
+    GV->setUnnamedAddr(true);
+    Constant *File = ConstantExpr::getGetElementPtr(GV->getValueType(), GV, GepArgs);
+
+    Ret.push_back(ConstantStruct::get(FedType, Line, File, nullptr));
   }
+  return Ret;
+}
 
-  BbIdBase = new GlobalVariable(M, Int32Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int32Ty, NumBasicBlocks), CsiBBIdBaseName);
-  assert(BbIdBase);
+// Returns a pointer to the first element
+Value *CodeSpectatorInterface::InsertFedTable(Module &M) {
+  LLVMContext &C = M.getContext();
+
+  SmallVector<Constant *, 4> FedEntries = ConvertFEDEntriesToConsts(M);
+  ArrayType *FedArrayType = ArrayType::get(CreateFedEntryType(C), FedEntries.size());
+
+  Constant *Table = ConstantArray::get(FedArrayType, FedEntries);
+  GlobalVariable *GV = new GlobalVariable(
+      M, FedArrayType, false, GlobalValue::InternalLinkage, Table, CsiUnitFedTableName);
+
+  Constant *Zero = ConstantInt::get(IntegerType::get(C, 32), 0);
+  Value *GepArgs[] = {Zero, Zero};
+  return ConstantExpr::getGetElementPtr(GV->getValueType(), GV, GepArgs);
+}
+
+void CodeSpectatorInterface::FinalizeCsi(Module &M) {
+  LLVMContext &C = M.getContext();
 
   // Add CSI global constructor, which calls unit init.
   Function *Ctor = Function::Create(
-      FunctionType::get(Type::getVoidTy(M.getContext()), false),
-      GlobalValue::InternalLinkage, CsiUnitCtorName, &M);
-  BasicBlock *CtorBB = BasicBlock::Create(M.getContext(), "", Ctor);
-  IRBuilder<> IRB(ReturnInst::Create(M.getContext(), CtorBB));
+      FunctionType::get(Type::getVoidTy(C), false),
+      GlobalValue::InternalLinkage, CsiRtUnitCtorName, &M);
+  BasicBlock *CtorBB = BasicBlock::Create(C, "", Ctor);
+  IRBuilder<> IRB(ReturnInst::Create(C, CtorBB));
 
-  SmallVector<Type *, 4> InitArgTypes({IRB.getInt8PtrTy(), IRB.getInt64Ty()});
-  Function *InitFunction = dyn_cast<Function>(M.getOrInsertFunction(CsiUnitInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
+  // Lookup __csirt_unit_init
+  SmallVector<Type *, 4> InitArgTypes({
+      IRB.getInt8PtrTy(),
+      IRB.getInt64Ty(),
+      PointerType::get(IRB.getInt64Ty(), 0),
+      PointerType::get(CreateFedEntryType(C), 0)
+  });
+  FunctionType *InitFunctionTy = FunctionType::get(IRB.getVoidTy(), InitArgTypes, false);
+  Function *InitFunction = checkCsiInterfaceFunction(
+      M.getOrInsertFunction(CsiRtUnitInitName, InitFunctionTy));
   assert(InitFunction);
 
-  Value *UnitName = IRB.CreateGlobalStringPtr(M.getName());
-  CallInst *Call = IRB.CreateCall(InitFunction, {UnitName, IRB.getInt64(NumBasicBlocks)});
+  // Insert call to __csirt_unit_init
+  CallInst *Call = IRB.CreateCall(InitFunction, {
+      IRB.CreateGlobalStringPtr(M.getName()),
+      IRB.getInt64((int64_t)FedEntries.size()),
+      UnitBaseId,
+      InsertFedTable(M)
+  });
 
+  // Add the constructor to the global list
   appendToGlobalCtors(M, Ctor, CsiUnitCtorPriority);
 
   CallGraphNode *CNCtor = CG->getOrInsertFunction(Ctor);
   CallGraphNode *CNFunc = CG->getOrInsertFunction(InitFunction);
   CNCtor->addCalledFunction(Call, CNFunc);
-
-  CsiInitialized = true;
 }
 
 void CodeSpectatorInterface::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -451,7 +529,7 @@ bool CodeSpectatorInterface::FunctionCallsFunction(Function *F, Function *G) {
 
 bool CodeSpectatorInterface::ShouldNotInstrumentFunction(Function &F) {
     Module &M = *F.getParent();
-    if (F.hasName() && F.getName() == CsiUnitCtorName) {
+    if (F.hasName() && F.getName() == CsiRtUnitCtorName) {
         return true;
     }
     // Don't instrument functions that will run before or
@@ -498,15 +576,20 @@ void CodeSpectatorInterface::computeAttributesForMemoryAccesses(
   LocalAccesses.clear();
 }
 
+bool CodeSpectatorInterface::runOnModule(Module &M) {
+  InitializeCsi(M);
+
+  for (Function &F : M)
+    runOnFunction(F);
+
+  FinalizeCsi(M);
+  return true;  // we always insert the unit constructor
+}
+
 bool CodeSpectatorInterface::runOnFunction(Function &F) {
   // This is required to prevent instrumenting the call to
   // __csi_module_init from within the module constructor.
-  if (!CsiInitialized) {
-    Module &M = *F.getParent();
-    InitializeCsi(M);
-  }
-
-  if (ShouldNotInstrumentFunction(F)) {
+  if (F.empty() || ShouldNotInstrumentFunction(F)) {
       return false;
   }
 
@@ -558,17 +641,25 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
 
   // Instrument function entry/exit points.
   IRBuilder<> IRB(F.getEntryBlock().getFirstInsertionPt());
+
+  if (DISubprogram *Subprog = llvm::getDISubprogram(&F)) {
+    FedEntries.push_back(fed_entry_t{(int32_t)Subprog->getLine(), Subprog->getFilename()});
+  } else {
+    FedEntries.push_back(fed_entry_t{-1, ""});
+  }
+  Value *CsiId = InsertCsiIdComputation(IRB);
+
   Value *Function = ConstantExpr::getBitCast(&F, IRB.getInt8PtrTy());
   Value *FunctionName = IRB.CreateGlobalStringPtr(F.getName());
   Value *ReturnAddress = IRB.CreateCall(
       Intrinsic::getDeclaration(F.getParent(), Intrinsic::returnaddress),
       IRB.getInt32(0));
-  IRB.CreateCall(CsiFuncEntry, {Function, ReturnAddress, FunctionName});
+  IRB.CreateCall(CsiFuncEntry, {CsiId, Function, ReturnAddress, FunctionName});
 
   for (BasicBlock::iterator I : RetVec) {
       Instruction *RetInst = &(*I);
       IRBuilder<> IRBRet(RetInst);
-      IRBRet.CreateCall(CsiFuncExit, {Function, ReturnAddress, FunctionName});
+      IRBRet.CreateCall(CsiFuncExit, {CsiId, Function, ReturnAddress, FunctionName});
   }
   Modified = true;
 
@@ -581,90 +672,3 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
 
 // End of compile-time pass
 // ------------------------------------------------------------------------
-// LTO (link-time) pass
-
-namespace {
-
-struct CodeSpectatorInterfaceLT : public ModulePass {
-  static char ID;
-
-  CodeSpectatorInterfaceLT() : ModulePass(ID), unitOffset(0), basicBlocksSeen(0) {}
-  const char *getPassName() const override;
-  bool runOnModule(Module &M) override;
-
-private:
-  unsigned unitOffset;
-  unsigned basicBlocksSeen;
-  Function *CsiCtorFunction;
-
-}; //struct CodeSpectatorInterfaceLT
-
-} // namespace
-
-char CodeSpectatorInterfaceLT::ID = 0;
-INITIALIZE_PASS(CodeSpectatorInterfaceLT, "CSI-lt", "CodeSpectatorInterface link-time pass",
-                false, false)
-
-ModulePass *llvm::createCodeSpectatorInterfaceLTPass() {
-  return new CodeSpectatorInterfaceLT();
-}
-
-const char *CodeSpectatorInterfaceLT::getPassName() const {
-  return "CodeSpectatorInterfaceLT";
-}
-
-bool CodeSpectatorInterfaceLT::runOnModule(Module &M) {
-  Type *Int64Ty = IntegerType::get(M.getContext(), 64);
-  GlobalVariable *UnitBase = new GlobalVariable(M, Int64Ty, false, GlobalValue::InternalLinkage, ConstantInt::get(Int64Ty, 0), CsiUnitBaseName);
-  // LLVMContext &C = M.getContext();
-  // StructType *CsiInfoType = StructType::create({IntegerType::get(C, 32)},
-  //                                              "__csi_info_t");
-  for (GlobalVariable &GV : M.getGlobalList()) {
-    if (GV.hasName()) {
-      StringRef name = GV.getName();
-      if (name.startswith(CsiUnitIdName)) {
-        assert(GV.hasInitializer());
-        Constant *UniqueUnitOffset = ConstantInt::get(GV.getInitializer()->getType(), unitOffset++);
-        GV.setInitializer(UniqueUnitOffset);
-        GV.setConstant(true);
-      } else if (name.startswith(CsiBBIdBaseName)) {
-        assert(GV.hasInitializer());
-        uint32_t blocksInUnit = (uint32_t)GV.getInitializer()->getUniqueInteger().getLimitedValue();
-        Constant *UniqueBbIdBase = ConstantInt::get(GV.getInitializer()->getType(), basicBlocksSeen);
-        GV.setInitializer(UniqueBbIdBase);
-        GV.setConstant(true);
-        basicBlocksSeen += blocksInUnit;
-      } else if (name.startswith(CsiUnitBasePtrName)) {
-        assert(GV.hasInitializer());
-        GV.setInitializer(UnitBase);
-        GV.setConstant(true);
-      }
-    }
-  }
-
-  // Add call to whole-program/tool init function.
-  Function *Ctor = Function::Create(
-      FunctionType::get(Type::getVoidTy(M.getContext()), false),
-      GlobalValue::InternalLinkage, CsiInitCtorName, &M);
-  BasicBlock *CtorBB = BasicBlock::Create(M.getContext(), "", Ctor);
-  IRBuilder<> IRB(ReturnInst::Create(M.getContext(), CtorBB));
-
-  const uint32_t NumUnits = unitOffset;
-
-  // The runtime library should call __csi_init
-  Value *Null = ConstantPointerNull::get(IRB.getInt8PtrTy());  // TODO(ddoucet): replace this with the fed entries
-  Value *TixName = IRB.CreateGlobalStringPtr(M.getName());
-  Value *UnitBasePtr = IRB.CreatePointerCast(UnitBase, IRB.getInt8PtrTy());
-  SmallVector<Value *, 4> InitArgs({TixName, UnitBasePtr, IRB.getInt64(NumUnits), Null});
-  SmallVector<Type *, 4> InitArgTypes({IRB.getInt8PtrTy(), IRB.getInt8PtrTy(), IRB.getInt64Ty(), IRB.getInt8PtrTy()});
-  Function *TixInit = checkCsiInterfaceFunction(
-          M.getOrInsertFunction(CsiRtTixInitName, FunctionType::get(IRB.getVoidTy(), InitArgTypes, false)));
-  assert(TixInit);
-  IRB.CreateCall(TixInit, InitArgs);
-
-  // Ensure whole-program init is called before module init.
-  // TODO: do all targets support this?
-  appendToGlobalCtors(M, Ctor, CsiInitCtorPriority);
-
-  return true;
-}

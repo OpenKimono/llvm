@@ -103,7 +103,6 @@ LTOCodeGenerator::~LTOCodeGenerator() {
 void LTOCodeGenerator::initializeLTOPasses() {
   PassRegistry &R = *PassRegistry::getPassRegistry();
 
-  initializeCodeSpectatorInterfaceLTPass(R);
   initializeInternalizePassPass(R);
   initializeIPSCCPPass(R);
   initializeGlobalOptPass(R);

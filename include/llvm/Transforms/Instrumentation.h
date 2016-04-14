@@ -85,7 +85,7 @@ ModulePass *createInstrProfilingPass(
 
 // Insert CodeSpectatorInterface instrumentation
 // ANGE XXX: Should probably add different compiler flag options
-FunctionPass *createCodeSpectatorInterfacePass();
+ModulePass *createCodeSpectatorInterfacePass();
 // Insert CodeSpectatorInterface link-time pass
 ModulePass *createCodeSpectatorInterfaceLTPass();
 
