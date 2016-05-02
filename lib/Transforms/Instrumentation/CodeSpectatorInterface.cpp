@@ -40,7 +40,9 @@ static const char *const CsiRtUnitInitName = "__csirt_unit_init";
 static const char *const CsiRtUnitCtorName = "csirt.unit_ctor";
 static const char *const CsiUnitBaseIdName = "__csi_unit_base_id";
 static const char *const CsiUnitFedTableName = "__csi_unit_fed_table";
+static const char *const CsiFuncIdVariablePrefix = "__csi_func_id_";
 
+static const uint64_t CsiCallsiteUnknownTargetId = 0xffffffffffffffff;
 // See llvm/tools/clang/lib/CodeGen/CodeGenModule.h:
 static const int CsiUnitCtorPriority = 65535;
 
@@ -77,6 +79,7 @@ private:
   void initializeFuncCallbacks(Module &M);
   // Basic block entry and exit instrumentation
   void initializeBasicBlockCallbacks(Module &M);
+  void initializeCallsiteCallbacks(Module &M);
   // actually insert the instrumentation call
   bool instrumentLoadOrStore(BasicBlock::iterator Iter, csi_acc_prop_t prop, const DataLayout &DL);
 
@@ -94,6 +97,7 @@ private:
                                    csi_acc_prop_t prop);
   // instrument a call to memmove, memcpy, or memset
   void instrumentMemIntrinsic(BasicBlock::iterator I);
+  void instrumentCallsite(CallSite &CS);
   bool instrumentBasicBlock(BasicBlock &BB);
   bool FunctionCallsFunction(Function *F, Function *G);
   bool ShouldNotInstrumentFunction(Function &F);
@@ -122,10 +126,13 @@ private:
   Function *CsiFuncExit;
   Function *CsiBBEntry, *CsiBBExit;
   Function *MemmoveFn, *MemcpyFn, *MemsetFn;
+  Function *CsiBeforeCallsite;
 
   Type *IntptrTy;
 
   SmallVector<fed_entry_t, 4> FedEntries;
+
+  std::map<std::string, uint64_t> FuncOffsetMap;
 }; //struct CodeSpectatorInterface
 } //namespace
 
@@ -164,9 +171,17 @@ void CodeSpectatorInterface::initializeBasicBlockCallbacks(Module &M) {
   FunctionType *FnType = FunctionType::get(IRB.getVoidTy(), ArgTypes, false);
   CsiBBEntry = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_bb_entry", FnType));
-  
+
   CsiBBExit = checkCsiInterfaceFunction(
       M.getOrInsertFunction("__csi_bb_exit", FnType));
+}
+
+void CodeSpectatorInterface::initializeCallsiteCallbacks(Module &M) {
+  IRBuilder<> IRB(M.getContext());
+  SmallVector<Type *, 4> ArgTypes({IRB.getInt64Ty(), IRB.getInt64Ty()});
+  FunctionType *FnType = FunctionType::get(IRB.getVoidTy(), ArgTypes, false);
+  CsiBeforeCallsite = checkCsiInterfaceFunction(
+      M.getOrInsertFunction("__csi_before_callsite", FnType));
 }
 
 /**
@@ -184,7 +199,7 @@ void CodeSpectatorInterface::initializeLoadStoreCallbacks(Module &M) {
   Type *RetType = IRB.getVoidTy();            // return void
   Type *AddrType = IRB.getInt8PtrTy();        // void *addr
   Type *NumBytesType = IRB.getInt32Ty();      // int num_bytes
-  
+
   // Initialize the instrumentation for reads, writes
 
   // void __csi_before_load(uint64_t csi_id, void *addr, int num_bytes, int attr);
@@ -379,6 +394,35 @@ bool CodeSpectatorInterface::instrumentBasicBlock(BasicBlock &BB) {
   return true;
 }
 
+void CodeSpectatorInterface::instrumentCallsite(CallSite &CS) {
+  Instruction *I = CS.getInstruction();
+  Module *M = I->getParent()->getParent()->getParent();
+  Function *Called = CS.getCalledFunction();
+
+  if (Called && Called->getName().startswith("llvm.dbg")) {
+      return;
+  }
+
+  if (DILocation *Loc = I->getDebugLoc()) {
+    FedEntries.push_back(fed_entry_t{(int32_t)Loc->getLine(), Loc->getFilename()});
+  } else {
+    FedEntries.push_back(fed_entry_t{-1, ""});
+  }
+
+  IRBuilder<> IRB(I);
+  Value *CsiId = InsertCsiIdComputation(IRB);
+
+  std::string GVName = CsiFuncIdVariablePrefix + Called->getName();
+  GlobalVariable *FuncIdGV = dyn_cast<GlobalVariable>(M->getOrInsertGlobal(GVName, IRB.getInt64Ty()));
+  assert(FuncIdGV);
+  FuncIdGV->setConstant(false);
+  FuncIdGV->setLinkage(GlobalValue::WeakAnyLinkage);
+  FuncIdGV->setInitializer(IRB.getInt64(CsiCallsiteUnknownTargetId));
+
+  Value *FuncId = IRB.CreateLoad(FuncIdGV);
+  IRB.CreateCall(CsiBeforeCallsite, {CsiId, FuncId});
+}
+
 bool CodeSpectatorInterface::doInitialization(Module &M) {
   DEBUG_WITH_TYPE("csi-func", errs() << "CSI_func: doInitialization" << "\n");
 
@@ -399,6 +443,7 @@ void CodeSpectatorInterface::InitializeCsi(Module &M) {
   initializeFuncCallbacks(M);
   initializeLoadStoreCallbacks(M);
   initializeBasicBlockCallbacks(M);
+  initializeCallsiteCallbacks(M);
 
   CG = &getAnalysis<CallGraphWrapperPass>().getCallGraph();
 }
@@ -477,6 +522,19 @@ void CodeSpectatorInterface::FinalizeCsi(Module &M) {
   Function *InitFunction = checkCsiInterfaceFunction(
       M.getOrInsertFunction(CsiRtUnitInitName, InitFunctionTy));
   assert(InitFunction);
+
+  // Insert __csi_func_id_<f> weak symbols for all defined functions
+  // and generate the runtime code that stores to all of them.
+  LoadInst *LI = IRB.CreateLoad(UnitBaseId);
+  for (const auto &it : FuncOffsetMap) {
+    std::string GVName = CsiFuncIdVariablePrefix + it.first;
+    GlobalVariable *GV = nullptr;
+    if ((GV = M.getGlobalVariable(GVName)) == nullptr) {
+        GV = new GlobalVariable(M, IRB.getInt64Ty(), false, GlobalValue::WeakAnyLinkage, IRB.getInt64(CsiCallsiteUnknownTargetId), GVName);
+    }
+    assert(GV);
+    IRB.CreateStore(IRB.CreateAdd(LI, IRB.getInt64(it.second)), GV);
+  }
 
   // Insert call to __csirt_unit_init
   CallInst *Call = IRB.CreateCall(InitFunction, {
@@ -602,8 +660,11 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
 
   SmallVector<BasicBlock::iterator, 8> RetVec;
   SmallVector<BasicBlock::iterator, 8> MemIntrinsics;
+  SmallVector<BasicBlock::iterator, 8> Callsites;
   bool Modified = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
+
+  FuncOffsetMap[F.getName()] = FuncOffsetMap.size();
 
   // Traverse all instructions in a function and insert instrumentation
   // on load & store
@@ -615,6 +676,7 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
       } else if (isa<ReturnInst>(*I)) {
         RetVec.push_back(II);
       } else if (isa<CallInst>(*I) || isa<InvokeInst>(*I)) {
+        Callsites.push_back(II);
         if (isa<MemIntrinsic>(I))
           MemIntrinsics.push_back(II);
         computeAttributesForMemoryAccesses(MemoryAccesses, LocalMemoryAccesses);
@@ -630,6 +692,11 @@ bool CodeSpectatorInterface::runOnFunction(Function &F) {
 
   for (BasicBlock::iterator I : MemIntrinsics)
     instrumentMemIntrinsic(I);
+
+  for (BasicBlock::iterator I : Callsites) {
+    CallSite CS(I);
+    instrumentCallsite(CS);
+  }
 
   // Instrument basic blocks
   // Note that we do this before function entry so that we put this at the
