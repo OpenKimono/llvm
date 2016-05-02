@@ -412,7 +412,7 @@ void CodeSpectatorInterface::instrumentCallsite(CallSite &CS) {
   IRBuilder<> IRB(I);
   Value *CsiId = InsertCsiIdComputation(IRB);
 
-  std::string GVName = CsiFuncIdVariablePrefix + Called->getName();
+  std::string GVName = CsiFuncIdVariablePrefix + Called->getName().str();
   GlobalVariable *FuncIdGV = dyn_cast<GlobalVariable>(M->getOrInsertGlobal(GVName, IRB.getInt64Ty()));
   assert(FuncIdGV);
   FuncIdGV->setConstant(false);
